@@ -1,0 +1,24 @@
+# Core Prefect
+prefect
+
+# Web Scraping
+selenium
+webdriver-manager
+
+# Database
+psycopg2-binary
+python-dotenv
+
+# Utilities
+requests
+typing-extensions
+
+# Optional: Web automation
+webdriver-manager
+
+
+yt-dlp
+boto3
+groq
+anthropic
+
