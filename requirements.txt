@@ -21,4 +21,5 @@ yt-dlp
 boto3
 groq
 anthropic
+pydantic
 

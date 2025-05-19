@@ -19,9 +19,10 @@ from selenium.common.exceptions import (
 )
 from webdriver_manager.chrome import ChromeDriverManager
 
-import psycopg2
-from psycopg2.extras import execute_values
 from dotenv import load_dotenv
+
+# Import database models
+from database import YTChannel, YTPrivateChannelVideo
 
 # Configure logging
 logging.basicConfig(
@@ -173,59 +174,65 @@ def extract_fmtt_videos(username: str, password: str, starting_url: str) -> List
         return all_videos
     
     except Exception as e:
-        logger.error(f"Comprehensive extraction eråror: {e}")
+        logger.error(f"Comprehensive extraction error: {e}")
         return []
     
     finally:
         if driver:
             driver.quit()
 
-def save_videos_to_database(videos: List[Dict[str, str]], db_connection_string: str) -> int:
+def save_videos_to_database(videos: List[Dict[str, str]], channel_id: int) -> int:
     """
-    Save video IDs to PostgreSQL, avoiding duplicates
+    Save video IDs to PostgreSQL using Pydantic models, avoiding duplicates
     
     :param videos: List of video dictionaries
-    :param db_connection_string: PostgreSQL connection string
+    :param channel_id: YouTube channel ID in database
     :return: Number of videos inserted
     """
     if not videos:
         return 0
     
     try:
-        with psycopg2.connect(db_connection_string) as conn:
-            with conn.cursor() as cursor:
-                # Upsert query for video IDs
-                insert_query = """
-                INSERT INTO yt_private_channel_video (name, video_id, yt_channel_id) 
-                VALUES %s 
-                ON CONFLICT (video_id) DO NOTHING
-                RETURNING id;
-                """
+        # Get the channel
+        channel = YTChannel.get_by_id(channel_id)
+        if not channel:
+            logger.error(f"Channel with ID {channel_id} not found")
+            return 0
+        
+        # Get existing videos to avoid duplicates
+        existing_videos = YTPrivateChannelVideo.get_by_channel_id(channel_id)
+        existing_video_ids = {video.video_id for video in existing_videos}
+        
+        inserted_count = 0
+        
+        # Insert videos using Pydantic models
+        for video in videos:
+            for video_id in video['video_ids']:
+                # Skip if already exists
+                if video_id in existing_video_ids:
+                    continue
                 
-                # Prepare values
-                values = []
-                for video in videos:
-                    for video_id in video['video_ids']:
-                        values.append((video['title'], video_id, 3))
-                
-                # Execute batch insert
-                execute_values(cursor, insert_query, values)
-                
-                # Count inserted rows
-                inserted_count = cursor.rowcount
-                
-                conn.commit()
-                return inserted_count
+                # Create and save video
+                private_video = YTPrivateChannelVideo(
+                    name=video['title'],
+                    video_id=video_id,
+                    yt_channel_id=channel_id
+                )
+                private_video.save()
+                inserted_count += 1
+                existing_video_ids.add(video_id)  # Update to avoid duplicates in this batch
+        
+        return inserted_count
     
     except Exception as e:
         logger.error(f"Database insertion error: {e}")
-        return 0            
+        return 0
 
 @flow(log_prints=True, persist_result=False)
 def fmtt_video_scraper(
     username: Optional[str] = None, 
-    password: Optional[str] = None, 
-    db_connection_string: Optional[str] = None,
+    password: Optional[str] = None,
+    channel_id: int = 3,  # Default FMTT channel ID
     starting_url: str = "https://feldenkraismanhattantraining.com/courses/nyc-training-program/lessons/day-1-2-7-25-chapter-2/"
 ):
     """
@@ -234,10 +241,9 @@ def fmtt_video_scraper(
     # Use environment variables as fallback
     username = username or os.getenv('FMTT_USERNAME')
     password = password or os.getenv('FMTT_PASSWORD')
-    db_connection_string = db_connection_string or os.getenv('DATABASE_URL')
     
     # Validate inputs
-    if not all([username, password, db_connection_string]):
+    if not all([username, password]):
         logger.error("Missing credentials. Provide via arguments or environment variables.")
         raise ValueError("Missing credentials. Provide via arguments or environment variables.")
     
@@ -248,8 +254,8 @@ def fmtt_video_scraper(
         logger.error("No videos found")
         return None
     
-    # Save to database
-    inserted_count = save_videos_to_database(all_videos, db_connection_string)
+    # Save to database using the new models
+    inserted_count = save_videos_to_database(all_videos, channel_id)
     
     return {
         "total_lesson_links": len(all_videos),

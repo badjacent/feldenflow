@@ -1,5 +1,4 @@
 import anthropic
-import difflib
 from typing import List
 from dotenv import load_dotenv
 import os

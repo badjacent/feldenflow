@@ -1,12 +1,10 @@
 import os
 import subprocess
 from typing import List, Dict, Optional, Tuple, Literal
-import psycopg2
 from prefect import task, get_run_logger
 from dotenv import load_dotenv
 import math
 import tempfile
-import boto3
 
 load_dotenv()
 
@@ -14,108 +12,7 @@ load_dotenv()
 # Source type literals
 SourceType = Literal["yt_video", "audio_file"]
 
-def get_next_groq_batch(source_type: SourceType) -> Dict:
-    files = get_next_groq_batch_files(source_type)
-    l = []
-    for f in files:
-        c = create_transcription_chunks(f)
-        for cc in c:
-            l.append(cc)
 
-    return l
-
-def get_next_groq_batch_files(source_type: SourceType) -> Dict:
-    """
-    Get file information from the source table
-    
-    Args:
-        source_type: Type of source ('yt_video' or 'audio_file')
-        source_id: ID of the source record
-        
-    Returns:
-        Dictionary with file information
-    """
-    logger = get_run_logger()
-    logger.info(f"Getting file info for {source_type}")
-    
-    db_connection_string =  os.getenv('DATABASE_URL')
-    conn = psycopg2.connect(db_connection_string)
-    cursor = conn.cursor()
-    
-    try:
-        if source_type == "yt_video":
-            # For YouTube videos
-            cursor.execute(
-                """SELECT yt_video.id, video_id, yt_channel.channel_id 
-                   FROM yt_video 
-                   INNER JOIN yt_channel on yt_video.yt_channel_id=yt_channel.id
-                   LEFT JOIN groq_job_chunk on groq_job_chunk.source_type='yt_video' and groq_job_chunk.source_id=yt_video.id
-                   WHERE upload_successful = B'1' AND groq_job_chunk.id IS NULL""",
-                ()
-            )
-            
-            rows = cursor.fetchmany(10)
-            
-            l = []
-            for row in rows:
-                # Construct file path based on convention
-                yt_channel_id = row[2]
-                video_id = row[1]
-                file_path = f"{os.getenv('VIDEO_PATH')}/{yt_channel_id}/{video_id}.mp3"
-                
-                # Check if file exists
-                if not os.path.exists(file_path):
-                    logger.warning(f"File not found at {file_path}")
-
-                else:         
-                    l.append({
-                        "id": row[0],
-                        "source_type": "yt_video",
-                        "video_id": video_id,
-                        "yt_channel_id": yt_channel_id,
-                        "local_path": file_path
-                    })
-            
-            return l
-            
-        elif source_type == "audio_file":
-            # For other audio files
-            cursor.execute(
-                """SELECT audio_file.id, audio_file.file_path, original_filename, file_size_bytes, duration_seconds
-                   FROM audio_file
-                   LEFT JOIN groq_job_chunk on groq_job_chunk.source_type='audio_file' and groq_job_chunk.source_id=audio_file.id
-                   WHERE groq_job_chunk.id IS NULL
-                   """,
-                ()
-            )
-            
-            rows = cursor.fetchmany(10)
-
-            l = []
-            for row in rows:
-                # Check if file exists
-                file_path = row[1]
-                if not os.path.exists(file_path):
-                    logger.warning(f"File not found at {file_path}")
-                
-                else:
-                    l.append({
-                        "id": row[0],
-                        "source_type": "audio_file",
-                        "original_filename": row[2],
-                        "file_size_bytes": row[3],
-                        "duration_seconds": row[4],
-                        "local_path": file_path
-                    })
-            return l
-            
-        else:
-            logger.error(f"Unknown source type: {source_type}")
-            return {}
-            
-    finally:
-        cursor.close()
-        conn.close()
 
 def get_audio_duration(input_file: str) -> float:
     """
@@ -400,7 +297,7 @@ def create_transcription_chunks(file_info: Dict, max_size_mb: int = 30, overlap_
         return []
     
     source_type = file_info["source_type"]
-    source_id = file_info["id"]
+    source_id = file_info["source_id"]
     input_file = file_info["local_path"]
     
     

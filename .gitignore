@@ -8,6 +8,7 @@ ENV/
 virtualenv/
 .Python
 .env
+.claude/
 prefect_venv/
 
 # Prefect specific

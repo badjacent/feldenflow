@@ -3,8 +3,8 @@ import asyncio
 import os
 import json
 import httpx
-import psycopg2
-from datetime import datetime
+from datetime import datetime, timezone
+import transcription_utils
 
 from prefect import flow, task, get_run_logger
 from prefect.blocks.system import Secret
@@ -12,13 +12,30 @@ from prefect.blocks.system import Secret
 from dotenv import load_dotenv
 load_dotenv()
 
-import connection
+# Import our database models
+from database import (
+    SourceType, 
+    YTChannel, 
+    YTVideo,
+    YTPrivateChannelVideo,
+    AudioFile,
+    Transcription,
+    GroqJob,
+    GroqJobChunk,
+    GroqJobStatus,
+    get_sources_ready_for_processing,
+    get_file_path_for_source,
+    create_job_chunk,
+    update_job_status,
+    merge_transcriptions,
+    get_source_file_info
+)
+
 from transcription_utils import (
     create_transcription_chunks,
-    SourceType
 )
 from groq_utils import (
-    create_groq_batch,
+    compile_groq_batch,
     create_groq_jsonl_file,
     send_groq_batch,
     retrieve_groq_job_status,
@@ -44,7 +61,6 @@ async def submit_groq_job(job: Dict) -> Dict:
 
     jsonl_file_path = create_groq_jsonl_file(job["chunks"])
     job = send_groq_batch(job["id"], jsonl_file_path)
-
     
     return job
 
@@ -55,79 +71,64 @@ async def check_groq_job_status(job_id: int) -> Dict:
     
     Args:
         job_id: ID of the Groq job in our database
-        api_key: Groq API key
         
     Returns:
         Updated job status dictionary
     """
     logger = get_run_logger()
-    
     api_key = os.getenv("GROQ_API_KEY")
-
     
     # Get job details from database
-    db_connection_string =  os.getenv('DATABASE_URL')
-    conn = psycopg2.connect(db_connection_string)
-    cursor = conn.cursor()
+    groq_job = GroqJob.get_by_id(job_id)
+    if not groq_job:
+        logger.error(f"Job with ID {job_id} not found in database")
+        return {"id": job_id, "status": "error", "error": "Job not found"}
     
+    # Skip if job is not in submitted status
+    if groq_job.status != "submitted":
+        logger.info(f"Job {groq_job.job_id} has status {groq_job.status}, skipping status check")
+        return {"id": job_id, "job_id": groq_job.job_id, "status": groq_job.status}
+    
+    # Check status with Groq API
     try:
-        cursor.execute(
-            """SELECT job_id, groq_job_id, status 
-               FROM groq_job 
-               WHERE id = %s""",
-            (job_id,)
-        )
-        
-        row = cursor.fetchone()
-        if not row:
-            logger.error(f"Job with ID {job_id} not found in database")
-            return {"id": job_id, "status": "error", "error": "Job not found"}
-        
-        db_job_id, groq_job_id, status = row
-        
-        # Skip if job is not in submitted status
-        if status != "submitted":
-            logger.info(f"Job {db_job_id} has status {status}, skipping status check")
-            return {"id": job_id, "job_id": db_job_id, "status": status}
-        
-        # Check status with Groq API
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.get(
-                f"https://api.groq.com/v1/audio/transcriptions/batch/{groq_job_id}",
+                f"https://api.groq.com/v1/audio/transcriptions/batch/{groq_job.groq_job_id}",
                 headers={
                     "Authorization": f"Bearer {api_key}"
                 }
             )
             
             if response.status_code != 200:
-                logger.error(f"Failed to check status of job {groq_job_id}: {response.text}")
-                return {"id": job_id, "job_id": db_job_id, "status": "error", "error": response.text}
+                logger.error(f"Failed to check status of job {groq_job.groq_job_id}: {response.text}")
+                # Update job with error status
+                update_job_status(
+                    groq_job, 
+                    status="error", 
+                    error=response.text
+                )
+                return {
+                    "id": job_id, 
+                    "job_id": groq_job.job_id, 
+                    "status": "error", 
+                    "error": response.text
+                }
             
             status_data = response.json()
             job_status = status_data.get("status")
             
-            logger.info(f"Job {db_job_id} (Groq job ID: {groq_job_id}) has status: {job_status}")
+            logger.info(f"Job {groq_job.job_id} (Groq job ID: {groq_job.groq_job_id}) has status: {job_status}")
             
             # Update database based on status
             if job_status == "completed":
                 # Get the results
                 results = status_data.get("results", [])
                 
-                # Get chunk mappings
-                cursor.execute(
-                    """SELECT gjc.id, gjc.transcription_chunk_id, tc.file_path
-                       FROM groq_job_chunk gjc
-                       JOIN transcription_chunk tc ON gjc.transcription_chunk_id = tc.id
-                       WHERE gjc.groq_job_id = %s""",
-                    (job_id,)
-                )
-                
+                # Get all chunks for this job
+                chunks = GroqJobChunk.get_by_job_id(job_id)
                 chunk_mappings = {
-                    os.path.basename(row[2]): {
-                        "groq_job_chunk_id": row[0],
-                        "transcription_chunk_id": row[1]
-                    }
-                    for row in cursor.fetchall()
+                    os.path.basename(chunk.s3_uri): chunk
+                    for chunk in chunks if chunk.s3_uri
                 }
                 
                 # Update each result
@@ -135,61 +136,53 @@ async def check_groq_job_status(job_id: int) -> Dict:
                     file_id = result.get("file_id")
                     transcription = result.get("text", "")
                     
-                    # In a real implementation, you'd have a better way to match results to chunks
-                    # Here, we're using a placeholder approach
-                    for file_name, mapping in chunk_mappings.items():
-                        # Match by file name or other identifiers from Groq
+                    # Match by file name or other identifiers from Groq
+                    for file_name, chunk in chunk_mappings.items():
                         if f"placeholder_file_id_for_{file_name}" == file_id:
-                            cursor.execute(
-                                """UPDATE groq_job_chunk
-                                   SET status = %s, updated_at = %s, transcription = %s
-                                   WHERE id = %s""",
-                                ("completed", datetime.now(), transcription, mapping["groq_job_chunk_id"])
-                            )
+                            # Update chunk with transcription
+                            chunk.transcription = transcription
+                            chunk.updated_at = datetime.now(timezone.utc)
+                            chunk.save()
                             break
                 
                 # Update job status
-                cursor.execute(
-                    """UPDATE groq_job
-                       SET status = %s, completed_at = %s
-                       WHERE id = %s""",
-                    ("completed", datetime.now(), job_id)
+                update_job_status(
+                    groq_job,
+                    status="completed",
+                    completed_at=datetime.now(timezone.utc)
                 )
                 
-                conn.commit()
-                logger.info(f"Updated job {db_job_id} status to completed")
+                logger.info(f"Updated job {groq_job.job_id} status to completed")
                 
                 return {
                     "id": job_id,
-                    "job_id": db_job_id,
+                    "job_id": groq_job.job_id,
                     "status": "completed",
-                    "completed_at": datetime.now().isoformat(),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
                     "results_count": len(results)
                 }
                 
             elif job_status == "failed":
                 # Update job status to failed
-                cursor.execute(
-                    """UPDATE groq_job
-                       SET status = %s, error_message = %s
-                       WHERE id = %s""",
-                    ("failed", status_data.get("error", "Unknown error"), job_id)
+                update_job_status(
+                    groq_job,
+                    status="failed",
+                    error=status_data.get("error", "Unknown error"),
+                    completed_at=datetime.now(timezone.utc)
                 )
                 
                 # Update all chunks to failed
-                cursor.execute(
-                    """UPDATE groq_job_chunk
-                       SET status = %s, updated_at = %s
-                       WHERE groq_job_id = %s""",
-                    ("failed", datetime.now(), job_id)
-                )
+                chunks = GroqJobChunk.get_by_job_id(job_id)
+                for chunk in chunks:
+                    chunk.status = "failed"
+                    chunk.updated_at = datetime.now(timezone.utc)
+                    chunk.save()
                 
-                conn.commit()
-                logger.info(f"Updated job {db_job_id} status to failed")
+                logger.info(f"Updated job {groq_job.job_id} status to failed")
                 
                 return {
                     "id": job_id,
-                    "job_id": db_job_id,
+                    "job_id": groq_job.job_id,
                     "status": "failed",
                     "error": status_data.get("error", "Unknown error")
                 }
@@ -198,41 +191,177 @@ async def check_groq_job_status(job_id: int) -> Dict:
                 # Job is still processing
                 return {
                     "id": job_id,
-                    "job_id": db_job_id,
+                    "job_id": groq_job.job_id,
                     "status": "processing",
                     "groq_status": job_status
                 }
     
     except Exception as e:
-        conn.rollback()
         logger.error(f"Error checking job status: {e}")
         return {"id": job_id, "status": "error", "error": str(e)}
-        
-    finally:
-        cursor.close()
-        conn.close()
 
-   
 
-@flow(name="Create Groq Batch", description="Create a batch of audio chunks for Groq processing")
-async def create_groq_batch_flow() -> Optional[Dict]:
+@flow(name="Groq Batch Processing", description="Create and compile a batch of audio chunks for Groq processing")
+async def batch_flow(
+    source_type: Optional[SourceType] = None,
+    source_id: Optional[int] = None,
+    process_all: bool = False,
+    max_sources_per_batch: int = 3
+) -> Optional[Dict]:
     """
-    Flow to create a batch of audio chunks for Groq processing
+    Flow to create and compile a batch of audio chunks for Groq processing.
+    Creates batches in memory, then compiles them (including breaking up files and uploading to S3)
+    and saves them to the database.
     
     Args:
-        max_chunks: Maximum number of chunks per batch
+        source_type: Optional specific source type to process
+        source_id: Optional specific source ID to process
+        process_all: Process all available sources
+        max_sources_per_batch: Maximum number of sources to process in a single batch (default: 3)
         
     Returns:
         Groq job dictionary or None if no chunks available
     """
     logger = get_run_logger()
-    logger.info(f"Creating a Groq batch")
     
-    batch = create_groq_batch()
+    condition = True
+    result_batch = None
     
-    if batch:
-        logger.info(f"Created batch with job ID {batch['job_id']} containing {batch['num_chunks']} chunks")
-    return batch
+    while condition:
+        if source_type and source_id:
+            # Handle specific source
+            logger.info(f"Processing a Groq batch for {source_type} with ID {source_id}")
+            
+            # Get source file info
+            source_info = get_source_file_info(source_type, source_id)
+            if not source_info:
+                logger.error(f"2 No source info found for {source_type} with ID {source_id}")
+                return None
+            
+            # Process in memory without saving to database yet
+            logger.info(f"Creating batch in memory for {source_type} with ID {source_id}")
+            
+            # Process the file into chunks
+            file_info = {
+                "source_type": source_info["source_type"],
+                "source_id": source_info["source_id"],
+                "local_path": source_info["local_path"],
+                "name": source_info["name"]
+            }
+            
+            # Create job in database only after processing
+            job_id = f"groq_job_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_1_chunks"
+            job = GroqJob(
+                job_id=job_id,
+                status="pending",
+                created_at=datetime.now(timezone.utc)
+            )
+            job = job.save()
+            
+            # Process chunks and save to database
+            processed_chunks = transcription_utils.create_transcription_chunks(file_info)
+            
+            # Create database records for each chunk
+            for i, chunk in enumerate(processed_chunks):
+                job_chunk = GroqJobChunk(
+                    groq_job_id=job.id,
+                    source_type=chunk["source_type"],
+                    source_id=chunk["source_id"],
+                    chunk_index=chunk.get("chunk_index", i),
+                    name=chunk.get("name", f"chunk_{i}"),
+                    s3_uri=chunk.get("s3_uri"),
+                    start_time=chunk.get("start_time"),
+                    end_time=chunk.get("end_time")
+                )
+                job_chunk.save()
+            
+            result_batch = {
+                "id": job.id,
+                "job_id": job.job_id,
+                "status": job.status,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "num_chunks": len(processed_chunks)
+            }
+            
+            logger.info(f"Created and compiled batch with job ID {job.job_id} containing {len(processed_chunks)} chunks")
+            
+        else:
+            # Handle next available sources
+            logger.info(f"Processing a Groq batch for next available entities (max {max_sources_per_batch} sources)")
+            
+            # Get sources ready for processing
+            sources = get_sources_ready_for_processing()
+            if not sources:
+                logger.info("No sources available for processing")
+                return None
+            
+            # Limit number of sources to process
+            sources_to_process = sources[:max_sources_per_batch]
+            num_sources = len(sources_to_process)
+            logger.info(f"Processing {num_sources} sources in this batch")
+            
+            # Create job in database
+            job_id = f"groq_job_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{num_sources}_sources"
+            job = GroqJob(
+                job_id=job_id,
+                status="pending",
+                created_at=datetime.now(timezone.utc)
+            )
+            job = job.save()
+            
+            all_processed_chunks = []
+            
+            # Process each source
+            for source in sources_to_process:
+                source_info = get_source_file_info(source["source_type"], source["source_id"])
+                
+                if not source_info:
+                    logger.error(f"No source info found for {source['source_type']} with ID {source['source_id']}")
+                    continue
+                
+                # Process in memory
+                file_info = {
+                    "source_type": source_info["source_type"],
+                    "source_id": source_info["source_id"],
+                    "local_path": source_info["local_path"],
+                    "name": source_info["name"]
+                }
+                
+                # Process chunks
+                processed_chunks = transcription_utils.create_transcription_chunks(file_info)
+                all_processed_chunks.extend(processed_chunks)
+                
+                logger.info(f"Processed {len(processed_chunks)} chunks for {source_info['source_type']} with ID {source_info['source_id']}")
+            
+            # Create database records for each chunk
+            for i, chunk in enumerate(all_processed_chunks):
+                job_chunk = GroqJobChunk(
+                    groq_job_id=job.id,
+                    source_type=chunk["source_type"],
+                    source_id=chunk["source_id"],
+                    chunk_index=chunk.get("chunk_index", i),
+                    name=chunk.get("name", f"chunk_{i}"),
+                    s3_uri=chunk.get("s3_uri"),
+                    start_time=chunk.get("start_time"),
+                    end_time=chunk.get("end_time")
+                )
+                job_chunk.save()
+            
+            result_batch = {
+                "id": job.id,
+                "job_id": job.job_id,
+                "status": job.status,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "num_chunks": len(all_processed_chunks),
+                "num_sources": num_sources
+            }
+            
+            logger.info(f"Created and compiled batch with job ID {job.job_id} containing {len(all_processed_chunks)} chunks from {num_sources} sources")
+        
+        # Exit loop if no process_all flag or if process_all is true but no batch was created
+        condition = process_all and result_batch is not None
+
+    return result_batch
 
 @flow(name="Submit Groq Batch", description="Submit a batch of audio chunks to Groq")
 async def submit_groq_batch_flow(batch_id: Optional[int] = None) -> Dict:
@@ -247,167 +376,155 @@ async def submit_groq_batch_flow(batch_id: Optional[int] = None) -> Dict:
     """
     logger = get_run_logger()
     
-    batch_id = 19
+    # Find the batch or use specified batch ID
     if batch_id:
-        # Get existing batch from database
-        db_connection_string =  os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(db_connection_string)
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute(
-                """SELECT id, job_id, status 
-                   FROM groq_job 
-                   WHERE id = %s""",
-                (batch_id,)
-            )
-            
-            row = cursor.fetchone()
-            if not row:
-                logger.error(f"Batch with ID {batch_id} not found")
-                return {"error": f"Batch with ID {batch_id} not found"}
-            
-            batch_info = {
-                "id": row[0],
-                "job_id": row[1],
-                "status": row[2]
-            }
-            
-            # Get chunks for this batch
-            cursor.execute(
-                """SELECT id, source_type, source_id, chunk_index, 
-                          start_time, end_time, s3_uri, name
-                   FROM groq_job_chunk gjc 
-                   WHERE gjc.groq_job_id = %s""",
-                (batch_id,)
-            )
-            
-            chunks = [
-                {
-                    "id": row[0],
-                    "source_type": row[1],
-                    "source_id": row[2],
-                    "chunk_index": row[3],
-                    "start_time": row[4],
-                    "end_time": row[5],
-                    "s3_uri": row[6],
-                    "name": row[7]
-                }
-                for row in cursor.fetchall()
-            ]
-            
-            logger.info(chunks)
-            batch_info["chunks"] = chunks
-            batch_info["num_chunks"] = len(chunks)
-            
-        finally:
-            cursor.close()
-            conn.close()
+        # Use the specified batch ID
+        logger.info(f"Using specified batch ID: {batch_id}")
+        groq_job = GroqJob.get_by_id(batch_id)
+        if not groq_job:
+            logger.error(f"Batch with ID {batch_id} not found")
+            return {"error": f"Batch with ID {batch_id} not found"}
     else:
-        # Create a new batch
-        batch_info = await create_groq_batch_flow()
-        
-        if not batch_info:
-            logger.info("No chunks available for processing")
-            return {"status": "no_chunks"}
+        # Find the earliest pending batch
+        groq_job = GroqJob.get_earliest_by_status("pending")
+        if not groq_job:
+            logger.info("No pending batches found to submit")
+            return {"status": "no_pending_batches"}
+        batch_id = groq_job.id
+        logger.info(f"Found earliest pending batch with ID: {batch_id}")
+    
+    # Check if batch is already submitted
+    if groq_job.status != "pending":
+        logger.warning(f"Batch {batch_id} has status '{groq_job.status}', not 'pending'")
+        return {"error": f"Batch {batch_id} has status '{groq_job.status}', not 'pending'"}
+    
+    # Get chunks for this batch
+    chunks = GroqJobChunk.get_by_job_id(batch_id)
+    if not chunks:
+        logger.warning(f"No chunks found for batch {batch_id}")
+        return {"error": f"No chunks found for batch {batch_id}"}
+    
+    logger.info(f"Found {len(chunks)} chunks for batch {batch_id}")
+    
+    # Transform chunks to the format expected by submit_groq_job
+    batch_info = {
+        "id": groq_job.id,
+        "job_id": groq_job.job_id,
+        "status": groq_job.status,
+        "chunks": [
+            {
+                "id": chunk.id,
+                "source_type": chunk.source_type,
+                "source_id": chunk.source_id,
+                "chunk_index": chunk.chunk_index,
+                "start_time": chunk.start_time,
+                "end_time": chunk.end_time,
+                "s3_uri": chunk.s3_uri,
+                "name": chunk.name
+            }
+            for chunk in chunks
+        ],
+        "num_chunks": len(chunks)
+    }
     
     # Submit the batch to Groq
     result = await submit_groq_job(batch_info)
     
-    # logger.info(f"Submitted batch {result["id"]} to Groq with status: {result["status"]}")
     return result
 
 
 @flow(name="Retrieve Groq Batch", description="Retrieve a batch of audio chunks to Groq")
 async def retrieve_groq_job_status_flow(batch_id: Optional[int] = None) -> Dict:
-    a = retrieve_groq_job_status(batch_id)
+    """
+    Flow to retrieve and update the status of a Groq batch
+    
+    Args:
+        batch_id: Optional ID of an existing batch to check
+        
+    Returns:
+        Job status dictionary
+    """
+    logger = get_run_logger()
+    
+    # If no batch_id is provided, find the earliest submitted batch
+    if not batch_id:
+        groq_job = GroqJob.get_earliest_by_status("submitted")
+        if groq_job:
+            batch_id = groq_job.id
+            logger.info(f"Found earliest submitted batch with ID: {batch_id}")
+        else:
+            logger.info("No submitted batches found to retrieve")
+            return {"status": "no_submitted_batches"}
+    
+    # Retrieve the batch status
+    status = retrieve_groq_job_status(batch_id)
+    
+    # Update chunks if needed
     update_groq_job_chunks(batch_id)
-    return a
+    
+    return status
 
 @flow(name="Combine Groq Batch", description="Create a batch of audio chunks for Groq processing")
-async def combine_groq_chunks_via_anthropic() -> Optional[Dict]:
-    # get next completed batch
+async def combine_groq_chunks_via_anthropic(
+    source_type: Optional[SourceType] = None, 
+    source_id: Optional[int] = None
+) -> Optional[Dict]:
     logger = get_run_logger()
-
-    db_connection_string =  os.getenv('DATABASE_URL')
-    conn = psycopg2.connect(db_connection_string)
-    cursor = conn.cursor()
     
-    try:
-        cursor.execute(
-            """with groq_finished as (
-                    select 
-                        source_type, 
-                        source_id 
-                    from 
-                        groq_job_chunk 
-                    group by 
-                        source_type, 
-                        source_id 
-                having SUM(CASE WHEN transcription is not null THEN 1 ELSE 0 END)=SUM(1)
-                )
-                select 
-                    groq_finished.source_type,
-                    groq_finished.source_id 
-                from 
-                    groq_finished
-                left join 
-                    transcription
-                on 
-                    groq_finished.source_type=transcription.source_type and groq_finished.source_id=transcription.source_id
-                where 
-                    transcription.source_id is null
-                order by 
-                    transcription.source_type, 
-                    transcription.source_id""",
-            ()
-        )
+    # If source_type and source_id are provided, use them directly
+    if source_type and source_id:
+        logger.info(f"Processing specified entity: {source_type} with ID {source_id}")
         
-        row = cursor.fetchone()
-        if not row:
+        # Verify that the entity exists and has completed transcriptions
+        chunks = GroqJobChunk.get_by_source(source_type, source_id)
+        
+        if not chunks:
+            logger.error(f"No chunks found for {source_type} with ID {source_id}")
+            return {"error": f"No chunks found for {source_type} with ID {source_id}"}
+        
+        incomplete_chunks = [chunk for chunk in chunks if not chunk.transcription]
+        if incomplete_chunks:
+            logger.error(f"Transcription incomplete for {source_type} with ID {source_id}. {len(incomplete_chunks)} chunks not transcribed.")
+            return {"error": f"Transcription incomplete for {source_type} with ID {source_id}"}
+    else:
+        # Get the first entity with completed transcriptions
+        completed_sources = GroqJobChunk.get_completed_sources_without_transcription()
+        if not completed_sources:
             logger.error(f"No transcriptions pending")
             return {"error": f"No transcriptions pending"}
         
-        source_type = row[0]
-        source_id = row[1]
-        
-        # Get chunks for this batch
-        cursor.execute(
-            """SELECT transcription
-                FROM groq_job_chunk gjc 
-                WHERE gjc.source_type = %s AND gjc.source_id = %s
-                ORDER BY gjc.chunk_index
-                """,
-            (source_type, source_id)
-        )
-        
-        transcriptions = [
-            {
-                row[0]
-            }
-            for row in cursor.fetchall()
-        ]
-
-        transcription = ""
-        if len(transcriptions) == 1:
-            transcription = transcriptions[0]
-        else:
-            transcription = merge_multiple_transcriptions(transcriptions)
-
-        cursor.execute(
-            """INSERT INTO TRANSCRIPTION (source_type, source_id, transcription)
-                VALUES(%s, %s, %s)
-                """,
-            (source_type, source_id, transcription)
-        )
-        conn.commit()
-        
-        
-        
-    finally:
-        cursor.close()
-        conn.close()
-
+        source_type = completed_sources[0]["source_type"]
+        source_id = completed_sources[0]["source_id"]
+        logger.info(f"Processing first available entity: {source_type} with ID {source_id}")
+    
+    # Get chunks for this source
+    chunks = GroqJobChunk.get_by_source(source_type, source_id)
+    chunks.sort(key=lambda x: x.chunk_index)
+    
+    # Extract transcriptions
+    transcriptions = [chunk.transcription for chunk in chunks if chunk.transcription]
+    
+    # Merge transcriptions
+    if len(transcriptions) == 1:
+        transcription_text = transcriptions[0]
+    else:
+        transcription_text = merge_multiple_transcriptions(transcriptions)
+    
+    # Save to database
+    transcription = Transcription(
+        source_type=source_type,
+        source_id=source_id,
+        transcription=transcription_text
+    )
+    transcription.save()
+    
+    return {
+        "status": "success",
+        "source_type": source_type,
+        "source_id": source_id,
+        "transcription_id": transcription.id,
+        "chunks_merged": len(transcriptions)
+    }
 
 
 @flow(name="Multi-Source Transcription Pipeline", description="Main flow for multi-source transcription pipeline")
@@ -426,19 +543,26 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Run Multi-Source Transcription Pipeline')
     parser.add_argument('--flow', choices=['batch', 'submit', 'retrieve', 'combine'], 
-                        default='batch', help='Which flow to run')
+                        help='Which flow to run')
     parser.add_argument('--source-type', choices=['yt_video', 'audio_file'], 
                         help='Source type for process or transcription flows')
     parser.add_argument('--source-id', type=int, help='Source ID for process or transcription flows')
-    parser.add_argument('--batch-id', type=int, help='Batch ID for submit flow')
+    parser.add_argument('--batch-id', type=int, help='Batch ID for submit or retrieve flow')
+    parser.add_argument('--process-all', type=bool, default=False, help='If true then process all')
+    parser.add_argument('--max-sources', type=int, default=3, 
+                        help='Maximum number of sources to process in a single batch (default: 3)')
+
     
     args = parser.parse_args()
+    process_all = args.process_all
     
     if args.flow == 'batch':
-        asyncio.run(create_groq_batch_flow())
+        asyncio.run(batch_flow(args.source_type, args.source_id, process_all, args.max_sources))
+
     elif args.flow == 'submit':
         asyncio.run(submit_groq_batch_flow(args.batch_id))
     elif args.flow == 'retrieve':
-        asyncio.run(retrieve_groq_job_status_flow(19))
+        asyncio.run(retrieve_groq_job_status_flow(args.batch_id))
     elif args.flow == 'combine':
-        asyncio.run(combine_groq_chunks_via_anthropic())        
+        # Pass the source_type and source_id to the combine flow
+        asyncio.run(combine_groq_chunks_via_anthropic(args.source_type, args.source_id))        
