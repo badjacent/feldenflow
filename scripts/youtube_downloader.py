@@ -37,9 +37,9 @@ def get_videos_to_process(limit=100):
     try:
         # Get videos that need to be downloaded
         cursor.execute(
-            """SELECT yt_video.id, video_id, yt_channel_id, yt_channel.channel_id
+            """SELECT yt_video.id, video_id, document_provider_id, document_provider.yt_channel_id
                FROM yt_video
-               INNER JOIN yt_channel on yt_channel_id=yt_channel.id
+               INNER JOIN document_provider on document_provider_id=document_provider.id
                WHERE upload_successful = B'0' 
                AND retries_remaining > 0
                LIMIT %s""",
@@ -78,7 +78,12 @@ async def download_video_task(video_info: Dict) -> Dict:
     db_channel_id = video_info["yt_channel_id"]
     
     logger.info(f"Processing video {video_id} for channel ID {db_channel_id}")
-    output_dir = "/Volumes/T9/Feld/yt"
+    storage_path = os.getenv('FILE_STORAGE_PATH')
+    
+    if not storage_path:
+        raise ValueError("FILE_STORAGE_PATH environment variable not set")
+    
+    output_dir = f"{storage_path}/yt"
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -198,10 +203,10 @@ def check_video_metadata_exists(video_id: str) -> bool:
         conn.close()
 
 @task
-def get_private_channel_videos(db_channel_id: int) -> List[Dict]:
-    """Get the list of videos for a private channel from the database"""
+def get_private_channel_videos(provider_id: int) -> List[Dict]:
+    """Get the list of videos for a private provider from the database"""
     logger = get_run_logger()
-    logger.info(f"Getting videos for private channel ID: {db_channel_id}")
+    logger.info(f"Getting videos for private provider ID: {provider_id}")
     
     # Connect to PostgreSQL
     db_connection_string =  os.getenv('DATABASE_URL')
@@ -212,8 +217,8 @@ def get_private_channel_videos(db_channel_id: int) -> List[Dict]:
         cursor.execute(
             """SELECT id, name, video_id 
                FROM yt_private_channel_video 
-               WHERE yt_channel_id = %s""",
-            (db_channel_id,)
+               WHERE document_provider_id = %s""",
+            (provider_id,)
         )
         
         videos = []
@@ -229,11 +234,11 @@ def get_private_channel_videos(db_channel_id: int) -> List[Dict]:
                 "metadata_exists": metadata_exists
             })
         
-        logger.info(f"Found {len(videos)} private videos for channel {db_channel_id}")
+        logger.info(f"Found {len(videos)} private videos for provider {provider_id}")
         return videos
         
     except Exception as e:
-        logger.error(f"Error getting private channel videos: {e}")
+        logger.error(f"Error getting private provider videos: {e}")
         raise
     
     finally:
@@ -289,7 +294,7 @@ def extract_video_metadata(video_info: Dict, retries=3, retry_delay=5) -> Dict:
     return video_info
 
 @task
-def insert_video_metadata(video_info: Dict, channel_id: int) -> Dict:
+def insert_video_metadata(video_info: Dict, provider_id: int) -> Dict:
     """Insert video metadata into the database if it doesn't exist yet"""
     logger = get_run_logger()
     video_id = video_info["video_id"]
@@ -334,9 +339,9 @@ def insert_video_metadata(video_info: Dict, channel_id: int) -> Dict:
             # Insert new entry
             cursor.execute(
                 """INSERT INTO yt_video 
-                   (yt_channel_id, video_id, upload_successful, retries_remaining, entry, create_date, update_date) 
+                   (document_provider_id, video_id, upload_successful, retries_remaining, entry, create_date, update_date) 
                    VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                (channel_id, video_id, 'B''0''', 3, entry_as_json, dt, dt)
+                (provider_id, video_id, 'B''0''', 3, entry_as_json, dt, dt)
             )
             new_id = cursor.fetchone()[0]
             logger.info(f"Inserted new metadata for video {video_id} with ID {new_id}")
@@ -399,26 +404,26 @@ async def download_videos_flow(videos_to_process: List[Dict] = None, limit: int 
     
     return results
 
-@flow(name="Process Private Channel", description="Process videos from a private YouTube channel")
-async def process_private_channel_flow(channel_id: int, channel_name: str) -> List[Dict]:
+@flow(name="Process Private Provider", description="Process videos from a private YouTube provider")
+async def process_private_provider_flow(provider_id: int, provider_name: str) -> List[Dict]:
     """
-    Flow to process videos from a private YouTube channel
+    Flow to process videos from a private YouTube provider
     
     Args:
-        channel_id: Database ID of the channel
-        channel_name: Name of the channel
+        provider_id: Database ID of the provider
+        provider_name: Name of the provider
         
     Returns:
         List of processed video dictionaries
     """
     logger = get_run_logger()
-    logger.info(f"Processing private channel: {channel_name} (ID: {channel_id})")
+    logger.info(f"Processing private provider: {provider_name} (ID: {provider_id})")
     
-    # Get videos for the private channel
-    private_videos = get_private_channel_videos(channel_id)
+    # Get videos for the private provider
+    private_videos = get_private_channel_videos(provider_id)
     
     if not private_videos:
-        logger.info(f"No videos found for private channel {channel_name}")
+        logger.info(f"No videos found for private provider {provider_name}")
         return []
     
     # Process each video to extract and save metadata (if needed)
@@ -428,12 +433,12 @@ async def process_private_channel_flow(channel_id: int, channel_name: str) -> Li
         if not video.get("metadata_exists", False):
             # Call tasks directly, not using .submit()
             video_with_metadata = extract_video_metadata(video)
-            video_with_db = insert_video_metadata(video_with_metadata, channel_id)
+            video_with_db = insert_video_metadata(video_with_metadata, provider_id)
             processed_videos.append(video_with_db)
         else:
             processed_videos.append(video)
     
-    logger.info(f"Processed {len(processed_videos)} videos for private channel {channel_name}")
+    logger.info(f"Processed {len(processed_videos)} videos for private provider {provider_name}")
     return processed_videos
 
 if __name__ == "__main__":
@@ -442,7 +447,7 @@ if __name__ == "__main__":
     
     # Example usage:
     # asyncio.run(download_videos_flow())  # Run download flow
-    # asyncio.run(process_private_channel_flow(1, "SampleChannel"))  # Process a private channel
+    # asyncio.run(process_private_provider_flow(1, "SampleChannel"))  # Process a private provider
     
     # Run the default flow
     asyncio.run(download_videos_flow())

@@ -22,7 +22,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from dotenv import load_dotenv
 
 # Import database models
-from database import YTChannel, YTPrivateChannelVideo
+from database import DocumentProvider, YTPrivateChannelVideo
 
 # Configure logging
 logging.basicConfig(
@@ -181,26 +181,26 @@ def extract_fmtt_videos(username: str, password: str, starting_url: str) -> List
         if driver:
             driver.quit()
 
-def save_videos_to_database(videos: List[Dict[str, str]], channel_id: int) -> int:
+def save_videos_to_database(videos: List[Dict[str, str]], provider_id: int) -> int:
     """
     Save video IDs to PostgreSQL using Pydantic models, avoiding duplicates
     
     :param videos: List of video dictionaries
-    :param channel_id: YouTube channel ID in database
+    :param provider_id: Document provider ID in database
     :return: Number of videos inserted
     """
     if not videos:
         return 0
     
     try:
-        # Get the channel
-        channel = YTChannel.get_by_id(channel_id)
-        if not channel:
-            logger.error(f"Channel with ID {channel_id} not found")
+        # Get the provider
+        provider = DocumentProvider.get_by_id(provider_id)
+        if not provider:
+            logger.error(f"Provider with ID {provider_id} not found")
             return 0
         
         # Get existing videos to avoid duplicates
-        existing_videos = YTPrivateChannelVideo.get_by_channel_id(channel_id)
+        existing_videos = YTPrivateChannelVideo.get_by_provider_id(provider_id)
         existing_video_ids = {video.video_id for video in existing_videos}
         
         inserted_count = 0
@@ -216,7 +216,7 @@ def save_videos_to_database(videos: List[Dict[str, str]], channel_id: int) -> in
                 private_video = YTPrivateChannelVideo(
                     name=video['title'],
                     video_id=video_id,
-                    yt_channel_id=channel_id
+                    document_provider_id=provider_id
                 )
                 private_video.save()
                 inserted_count += 1
@@ -232,7 +232,7 @@ def save_videos_to_database(videos: List[Dict[str, str]], channel_id: int) -> in
 def fmtt_video_scraper(
     username: Optional[str] = None, 
     password: Optional[str] = None,
-    channel_id: int = 3,  # Default FMTT channel ID
+    provider_id: int = 3,  # Default FMTT provider ID
     starting_url: str = "https://feldenkraismanhattantraining.com/courses/nyc-training-program/lessons/day-1-2-7-25-chapter-2/"
 ):
     """
@@ -255,7 +255,7 @@ def fmtt_video_scraper(
         return None
     
     # Save to database using the new models
-    inserted_count = save_videos_to_database(all_videos, channel_id)
+    inserted_count = save_videos_to_database(all_videos, provider_id)
     
     return {
         "total_lesson_links": len(all_videos),

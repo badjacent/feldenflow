@@ -14,7 +14,7 @@ CREATE SEQUENCE IF NOT EXISTS yt_video_id_seq;
 -- Table Definition
 CREATE TABLE "public"."yt_video" (
     "id" int4 NOT NULL DEFAULT nextval('yt_video_id_seq'::regclass),
-    "yt_channel_id" int4,
+    "document_provider_id" int4,
     "video_id" text,
     "upload_successful" bit,
     "retries_remaining" int4,
@@ -25,16 +25,17 @@ CREATE TABLE "public"."yt_video" (
 );
 
 -- Sequence and defined type
-CREATE SEQUENCE IF NOT EXISTS yt_channel_id_seq;
+CREATE SEQUENCE IF NOT EXISTS document_provider_id_seq;
 
 -- Table Definition
-CREATE TABLE "public"."yt_channel" (
-    "id" int4 NOT NULL DEFAULT nextval('yt_channel_id_seq'::regclass),
+CREATE TABLE "public"."document_provider" (
+    "id" int4 NOT NULL DEFAULT nextval('document_provider_id_seq'::regclass),
     "name" text NOT NULL,
-    "channel_id" text NOT NULL,
-    "upload_active" bit NOT NULL,
-    "upload_from_date" timestamptz,
-    "private_channel" bit NOT NULL DEFAULT '0'::"bit",
+    "yt_name" text,
+    "yt_channel_id" text,
+    "yt_upload_active" bit,
+    "yt_upload_from_date" timestamptz,
+    "yt_private_channel" bit,
     PRIMARY KEY ("id")
 );
 
@@ -75,7 +76,7 @@ CREATE TABLE "public"."yt_private_channel_video" (
     "id" int4 NOT NULL DEFAULT nextval('fmtt_video_id_seq'::regclass),
     "name" text DEFAULT ''::text,
     "video_id" text NOT NULL DEFAULT '''''::t4ext'::text,
-    "yt_channel_id" int4 NOT NULL DEFAULT 0,
+    "document_provider_id" int4 NOT NULL DEFAULT 0,
     PRIMARY KEY ("id")
 );
 
@@ -116,12 +117,12 @@ CREATE TABLE "public"."groq_job_chunk" (
     PRIMARY KEY ("id")
 );
 
-ALTER TABLE "public"."yt_video" ADD FOREIGN KEY ("yt_channel_id") REFERENCES "public"."yt_channel"("id");
+ALTER TABLE "public"."yt_video" ADD FOREIGN KEY ("document_provider_id") REFERENCES "public"."document_provider"("id");
 
 
 -- Indices
 CREATE UNIQUE INDEX groq_job_job_id_key ON public.groq_job USING btree (job_id);
-ALTER TABLE "public"."yt_private_channel_video" ADD FOREIGN KEY ("yt_channel_id") REFERENCES "public"."yt_channel"("id");
+ALTER TABLE "public"."yt_private_channel_video" ADD FOREIGN KEY ("document_provider_id") REFERENCES "public"."document_provider"("id");
 
 
 -- Indices

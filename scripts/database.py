@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Source type literals
-SourceType = Literal["yt_video", "audio_file"]
+SourceType = Literal["yt_video", "audio_file", "text_file"]
 
 
 # Base models
@@ -41,30 +41,38 @@ class DBModel(BaseModel):
         return psycopg2.connect(db_connection_string)
 
 
-# Channel models
+# Provider models
 
-class YTChannel(DBModel):
-    """YouTube channel model."""
+class DocumentProvider(DBModel):
+    """Document provider model."""
     id: Optional[int] = None
     name: str
-    channel_id: str
-    upload_active: bool = True
-    upload_from_date: Optional[datetime] = None
-    private_channel: bool = False
+    yt_name: Optional[str] = None
+    yt_channel_id: Optional[str] = None
+    yt_upload_active: Optional[bool] = None
+    yt_upload_from_date: Optional[datetime] = None
+    yt_private_channel: Optional[bool] = None
+    
+    @validator('yt_name', pre=True)
+    def clean_yt_name(cls, v, values):
+        """Clean YouTube name by removing @ symbol."""
+        if v and isinstance(v, str):
+            return v.replace('@', '')
+        return v
 
     @classmethod
-    def get_by_id(cls, channel_id: int) -> Optional['YTChannel']:
-        """Get channel by ID."""
+    def get_by_id(cls, provider_id: int) -> Optional['DocumentProvider']:
+        """Get provider by ID."""
         with cls.get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
-                    """SELECT id, name, channel_id, 
-                       upload_active::int::boolean as upload_active, 
-                       upload_from_date,
-                       private_channel::int::boolean as private_channel
-                       FROM yt_channel 
+                    """SELECT id, name, yt_name, yt_channel_id, 
+                       yt_upload_active::int::boolean as yt_upload_active, 
+                       yt_upload_from_date,
+                       yt_private_channel::int::boolean as yt_private_channel
+                       FROM document_provider 
                        WHERE id = %s""",
-                    (channel_id,)
+                    (provider_id,)
                 )
                 record = cursor.fetchone()
                 if not record:
@@ -72,57 +80,57 @@ class YTChannel(DBModel):
                 return cls(**record)
 
     @classmethod
-    def get_all_active(cls) -> List['YTChannel']:
-        """Get all active channels."""
+    def get_all_active_youtube(cls) -> List['DocumentProvider']:
+        """Get all active YouTube providers."""
         with cls.get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
-                    """SELECT id, name, channel_id,
-                       upload_active::int::boolean as upload_active,
-                       upload_from_date,
-                       private_channel::int::boolean as private_channel
-                       FROM yt_channel 
-                       WHERE upload_active = B'1'"""
+                    """SELECT id, name, yt_name, yt_channel_id,
+                       yt_upload_active::int::boolean as yt_upload_active,
+                       yt_upload_from_date,
+                       yt_private_channel::int::boolean as yt_private_channel
+                       FROM document_provider 
+                       WHERE yt_upload_active = B'1'"""
                 )
                 records = cursor.fetchall()
-                channels = []
+                providers = []
                 for record in records:
                     try:
-                        channels.append(cls(**record))
+                        providers.append(cls(**record))
                     except Exception as e:
-                        print(f"Error creating channel from record {record}: {e}")
-                return channels
+                        print(f"Error creating provider from record {record}: {e}")
+                return providers
 
-    def save(self) -> 'YTChannel':
-        """Save channel to database."""
+    def save(self) -> 'DocumentProvider':
+        """Save provider to database."""
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
                 if self.id:
-                    # Update existing channel
+                    # Update existing provider
                     cursor.execute(
-                        """UPDATE yt_channel 
-                           SET name = %s, channel_id = %s, 
-                           upload_active = %s, upload_from_date = %s,
-                           private_channel = %s
+                        """UPDATE document_provider 
+                           SET name = %s, yt_name = %s, yt_channel_id = %s, 
+                           yt_upload_active = %s, yt_upload_from_date = %s,
+                           yt_private_channel = %s
                            WHERE id = %s
                            RETURNING id""",
-                        (self.name, self.channel_id, 
-                         'B\'1\'' if self.upload_active else 'B\'0\'',
-                         self.upload_from_date,
-                         'B\'1\'' if self.private_channel else 'B\'0\'',
+                        (self.name, self.yt_name, self.yt_channel_id, 
+                         'B\'1\'' if self.yt_upload_active else 'B\'0\'' if self.yt_upload_active is not None else None,
+                         self.yt_upload_from_date,
+                         'B\'1\'' if self.yt_private_channel else 'B\'0\'' if self.yt_private_channel is not None else None,
                          self.id)
                     )
                 else:
-                    # Insert new channel
+                    # Insert new provider
                     cursor.execute(
-                        """INSERT INTO yt_channel 
-                           (name, channel_id, upload_active, upload_from_date, private_channel) 
-                           VALUES (%s, %s, %s, %s, %s) 
+                        """INSERT INTO document_provider 
+                           (name, yt_name, yt_channel_id, yt_upload_active, yt_upload_from_date, yt_private_channel) 
+                           VALUES (%s, %s, %s, %s, %s, %s) 
                            RETURNING id""",
-                        (self.name, self.channel_id, 
-                         'B\'1\'' if self.upload_active else 'B\'0\'',
-                         self.upload_from_date,
-                         'B\'1\'' if self.private_channel else 'B\'0\'')
+                        (self.name, self.yt_name, self.yt_channel_id, 
+                         'B\'1\'' if self.yt_upload_active else 'B\'0\'' if self.yt_upload_active is not None else None,
+                         self.yt_upload_from_date,
+                         'B\'1\'' if self.yt_private_channel else 'B\'0\'' if self.yt_private_channel is not None else None)
                     )
                 self.id = cursor.fetchone()[0]
                 conn.commit()
@@ -145,7 +153,7 @@ class YTVideoEntry(BaseModel):
 class YTVideo(DBModel):
     """YouTube video model."""
     id: Optional[int] = None
-    yt_channel_id: int
+    document_provider_id: int
     video_id: str
     upload_successful: bool = False
     retries_remaining: int = 3
@@ -170,7 +178,7 @@ class YTVideo(DBModel):
         with cls.get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
-                    """SELECT id, yt_channel_id, video_id, 
+                    """SELECT id, document_provider_id, video_id, 
                        upload_successful::int::boolean as upload_successful, 
                        retries_remaining, entry, create_date, update_date
                        FROM yt_video 
@@ -188,7 +196,7 @@ class YTVideo(DBModel):
         with cls.get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
-                    """SELECT id, yt_channel_id, video_id, 
+                    """SELECT id, document_provider_id, video_id, 
                        upload_successful::int::boolean as upload_successful, 
                        retries_remaining, entry, create_date, update_date
                        FROM yt_video 
@@ -201,24 +209,24 @@ class YTVideo(DBModel):
                 return cls(**record)
 
     @classmethod
-    def get_pending_downloads(cls, channel_id: Optional[int] = None) -> List['YTVideo']:
+    def get_pending_downloads(cls, provider_id: Optional[int] = None) -> List['YTVideo']:
         """Get videos pending download."""
         with cls.get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                if channel_id:
+                if provider_id:
                     cursor.execute(
-                        """SELECT id, yt_channel_id, video_id, 
+                        """SELECT id, document_provider_id, video_id, 
                            upload_successful::int::boolean as upload_successful, 
                            retries_remaining, entry, create_date, update_date
                            FROM yt_video 
-                           WHERE yt_channel_id = %s 
+                           WHERE document_provider_id = %s 
                            AND upload_successful = B'0' 
                            AND retries_remaining > 0""",
-                        (channel_id,)
+                        (provider_id,)
                     )
                 else:
                     cursor.execute(
-                        """SELECT id, yt_channel_id, video_id, 
+                        """SELECT id, document_provider_id, video_id, 
                            upload_successful::int::boolean as upload_successful, 
                            retries_remaining, entry, create_date, update_date
                            FROM yt_video 
@@ -237,12 +245,12 @@ class YTVideo(DBModel):
                     # Update existing video
                     cursor.execute(
                         """UPDATE yt_video 
-                           SET yt_channel_id = %s, video_id = %s, 
+                           SET document_provider_id = %s, video_id = %s, 
                            upload_successful = %s, retries_remaining = %s,
                            entry = %s, update_date = %s
                            WHERE id = %s
                            RETURNING id""",
-                        (self.yt_channel_id, self.video_id,
+                        (self.document_provider_id, self.video_id,
                          'B\'1\'' if self.upload_successful else 'B\'0\'',
                          self.retries_remaining,
                          json.dumps(self.entry.dict()),
@@ -252,11 +260,11 @@ class YTVideo(DBModel):
                     # Insert new video
                     cursor.execute(
                         """INSERT INTO yt_video 
-                           (yt_channel_id, video_id, upload_successful, retries_remaining, 
+                           (document_provider_id, video_id, upload_successful, retries_remaining, 
                             entry, create_date, update_date) 
                            VALUES (%s, %s, %s, %s, %s, %s, %s) 
                            RETURNING id""",
-                        (self.yt_channel_id, self.video_id,
+                        (self.document_provider_id, self.video_id,
                          'B\'1\'' if self.upload_successful else 'B\'0\'',
                          self.retries_remaining,
                          json.dumps(self.entry.dict()),
@@ -277,7 +285,7 @@ class YTPrivateChannelVideo(DBModel):
     id: Optional[int] = None
     name: str = ""
     video_id: str
-    yt_channel_id: int
+    document_provider_id: int
 
     @classmethod
     def get_by_id(cls, video_id: int) -> Optional['YTPrivateChannelVideo']:
@@ -285,7 +293,7 @@ class YTPrivateChannelVideo(DBModel):
         with cls.get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
-                    """SELECT id, name, video_id, yt_channel_id
+                    """SELECT id, name, video_id, document_provider_id
                        FROM yt_private_channel_video 
                        WHERE id = %s""",
                     (video_id,)
@@ -296,15 +304,15 @@ class YTPrivateChannelVideo(DBModel):
                 return cls(**record)
 
     @classmethod
-    def get_by_channel_id(cls, channel_id: int) -> List['YTPrivateChannelVideo']:
-        """Get all private videos for a channel."""
+    def get_by_provider_id(cls, provider_id: int) -> List['YTPrivateChannelVideo']:
+        """Get all private videos for a provider."""
         with cls.get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
-                    """SELECT id, name, video_id, yt_channel_id
+                    """SELECT id, name, video_id, document_provider_id
                        FROM yt_private_channel_video 
-                       WHERE yt_channel_id = %s""",
-                    (channel_id,)
+                       WHERE document_provider_id = %s""",
+                    (provider_id,)
                 )
                 records = cursor.fetchall()
                 return [cls(**record) for record in records]
@@ -317,19 +325,19 @@ class YTPrivateChannelVideo(DBModel):
                     # Update existing private video
                     cursor.execute(
                         """UPDATE yt_private_channel_video 
-                           SET name = %s, video_id = %s, yt_channel_id = %s
+                           SET name = %s, video_id = %s, document_provider_id = %s
                            WHERE id = %s
                            RETURNING id""",
-                        (self.name, self.video_id, self.yt_channel_id, self.id)
+                        (self.name, self.video_id, self.document_provider_id, self.id)
                     )
                 else:
                     # Insert new private video
                     cursor.execute(
                         """INSERT INTO yt_private_channel_video 
-                           (name, video_id, yt_channel_id) 
+                           (name, video_id, document_provider_id) 
                            VALUES (%s, %s, %s) 
                            RETURNING id""",
-                        (self.name, self.video_id, self.yt_channel_id)
+                        (self.name, self.video_id, self.document_provider_id)
                     )
                 self.id = cursor.fetchone()[0]
                 conn.commit()
@@ -425,6 +433,115 @@ class AudioFile(DBModel):
                         (self.file_path, self.original_filename,
                          self.file_size_bytes, self.duration_seconds,
                          self.source_type, json.dumps(self.metadata),
+                         now, now)
+                    )
+                self.id = cursor.fetchone()[0]
+                conn.commit()
+                self.updated_at = now
+                if not self.created_at:
+                    self.created_at = now
+                return self
+
+# Text file models
+
+class TextField(DBModel):
+    """Text file model."""
+    id: Optional[int] = None
+    document_provider_id: int
+    file_path: str
+    original_filename: str
+    file_size_bytes: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    @root_validator(pre=True)
+    def parse_metadata(cls, values):
+        """Parse the metadata field if it's a string."""
+        metadata = values.get('metadata')
+        if isinstance(metadata, str):
+            try:
+                values['metadata'] = json.loads(metadata)
+            except json.JSONDecodeError:
+                raise ValueError("Invalid JSON in metadata field")
+        elif metadata is None:
+            values['metadata'] = {}
+        return values
+
+    @classmethod
+    def get_by_id(cls, file_id: int) -> Optional['TextField']:
+        """Get text file by ID."""
+        with cls.get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """SELECT id, document_provider_id, file_path, original_filename, file_size_bytes,
+                       metadata, created_at, updated_at
+                       FROM text_file 
+                       WHERE id = %s""",
+                    (file_id,)
+                )
+                record = cursor.fetchone()
+                if not record:
+                    return None
+                return cls(**record)
+                
+    @classmethod
+    def get_by_provider_id(cls, provider_id: int) -> List['TextField']:
+        """Get all text files for a provider."""
+        with cls.get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """SELECT id, document_provider_id, file_path, original_filename, file_size_bytes,
+                       metadata, created_at, updated_at
+                       FROM text_file 
+                       WHERE document_provider_id = %s""",
+                    (provider_id,)
+                )
+                records = cursor.fetchall()
+                return [cls(**record) for record in records]
+                
+    @classmethod
+    def get_all_without_transcription(cls) -> List['TextField']:
+        """Get all text files without transcription."""
+        with cls.get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """SELECT tf.id, tf.document_provider_id, tf.file_path, tf.original_filename, 
+                       tf.file_size_bytes, tf.metadata, tf.created_at, tf.updated_at
+                       FROM text_file tf
+                       LEFT JOIN transcription t ON t.source_type = 'text_file' AND t.source_id = tf.id
+                       WHERE t.id IS NULL"""
+                )
+                records = cursor.fetchall()
+                return [cls(**record) for record in records]
+
+    def save(self) -> 'TextField':
+        """Save text file to database."""
+        now = datetime.now(timezone.utc)
+        with self.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                if self.id:
+                    # Update existing text file
+                    cursor.execute(
+                        """UPDATE text_file 
+                           SET document_provider_id = %s, file_path = %s, original_filename = %s,
+                           file_size_bytes = %s, metadata = %s, updated_at = %s
+                           WHERE id = %s
+                           RETURNING id""",
+                        (self.document_provider_id, self.file_path, self.original_filename,
+                         self.file_size_bytes, json.dumps(self.metadata),
+                         now, self.id)
+                    )
+                else:
+                    # Insert new text file
+                    cursor.execute(
+                        """INSERT INTO text_file 
+                           (document_provider_id, file_path, original_filename, file_size_bytes, 
+                            metadata, created_at, updated_at) 
+                           VALUES (%s, %s, %s, %s, %s, %s, %s) 
+                           RETURNING id""",
+                        (self.document_provider_id, self.file_path, self.original_filename,
+                         self.file_size_bytes, json.dumps(self.metadata),
                          now, now)
                     )
                 self.id = cursor.fetchone()[0]
@@ -782,9 +899,9 @@ def get_sources_ready_for_processing() -> List[Dict[str, Any]]:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(
                 """SELECT yv.id as source_id, 'yt_video' as source_type, 
-                   yv.video_id, yc.channel_id
+                   yv.video_id, dp.yt_channel_id
                    FROM yt_video yv
-                   INNER JOIN yt_channel yc ON yv.yt_channel_id = yc.id
+                   INNER JOIN document_provider dp ON yv.document_provider_id = dp.id
                    LEFT JOIN groq_job_chunk gjc ON gjc.source_type = 'yt_video' AND gjc.source_id = yv.id
                    WHERE yv.upload_successful = B'1' AND gjc.id IS NULL
                 """
@@ -808,13 +925,13 @@ def get_sources_ready_for_processing() -> List[Dict[str, Any]]:
 def get_file_path_for_source(source_type: SourceType, source_id: int) -> Optional[str]:
     """Get the file path for a source."""
     if source_type == "yt_video":
-        # For YouTube videos we need to look up the channel and video ID
+        # For YouTube videos we need to look up the provider and video ID
         with DBModel.get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
-                    """SELECT yt_video.video_id, yt_channel.channel_id 
+                    """SELECT yt_video.video_id, document_provider.yt_channel_id 
                        FROM yt_video 
-                       INNER JOIN yt_channel ON yt_video.yt_channel_id = yt_channel.id
+                       INNER JOIN document_provider ON yt_video.document_provider_id = document_provider.id
                        WHERE yt_video.id = %s""",
                     (source_id,)
                 )
@@ -823,13 +940,13 @@ def get_file_path_for_source(source_type: SourceType, source_id: int) -> Optiona
                     return None
                 
                 video_id = record["video_id"]
-                channel_id = record["channel_id"]
-                video_path = os.getenv('VIDEO_PATH')
+                channel_id = record["yt_channel_id"]
+                storage_path = os.getenv('FILE_STORAGE_PATH')
                 
-                if not video_path:
-                    raise ValueError("VIDEO_PATH environment variable not set")
+                if not storage_path:
+                    raise ValueError("FILE_STORAGE_PATH environment variable not set")
                 
-                return f"{video_path}/{channel_id}/{video_id}.mp3"
+                return f"{storage_path}/yt/{channel_id}/{video_id}.mp3"
     
     elif source_type == "audio_file":
         # For audio files we just need to look up the file path
@@ -932,13 +1049,17 @@ def get_source_file_info(source_type: SourceType, source_id: int) -> Optional[Di
         if not video:
             return None
             
-        # Get the channel
-        channel = YTChannel.get_by_id(video.yt_channel_id)
-        if not channel:
+        # Get the provider
+        provider = DocumentProvider.get_by_id(video.document_provider_id)
+        if not provider:
             return None
             
         # Construct file path based on convention
-        file_path = f"{os.getenv('VIDEO_PATH')}/{channel.channel_id}/{video.video_id}.mp3"
+        storage_path = os.getenv('FILE_STORAGE_PATH')
+        if not storage_path:
+            raise ValueError("FILE_STORAGE_PATH environment variable not set")
+            
+        file_path = f"{storage_path}/yt/{provider.yt_channel_id}/{video.video_id}.mp3"
         
         # Check if file exists
         if not os.path.exists(file_path):
@@ -949,7 +1070,7 @@ def get_source_file_info(source_type: SourceType, source_id: int) -> Optional[Di
             "source_type": "yt_video",
             "source_id": video.id,
             "video_id": video.video_id,
-            "yt_channel_id": channel.channel_id,
+            "yt_channel_id": provider.yt_channel_id,
             "local_path": file_path,
             "name": video.video_id
         }

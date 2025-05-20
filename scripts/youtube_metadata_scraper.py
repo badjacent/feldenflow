@@ -12,65 +12,66 @@ from datetime import timedelta
 from dotenv import load_dotenv
 
 # Import database models
-from database import YTChannel, YTVideo, YTVideoEntry, YTPrivateChannelVideo
+from database import DocumentProvider, YTVideo, YTVideoEntry, YTPrivateChannelVideo
 
 load_dotenv()
 
 
 @task(retries=3, retry_delay_seconds=5, cache_key_fn=task_input_hash, cache_expiration=timedelta(hours=1))
-def get_db_channel_info(channel_id=None):
+def get_db_provider_info(provider_id=None):
     """
-    Get channel information from the database.
-    If channel_id is provided, get only that channel, otherwise get all active channels.
+    Get provider information from the database.
+    If provider_id is provided, get only that provider, otherwise get all active YouTube providers.
     """
     logger = get_run_logger()
-    logger.info(f"Getting channel info from database")
+    logger.info(f"Getting provider info from database")
     
-    if channel_id:
-        channel = YTChannel.get_by_id(channel_id)
-        return [channel] if channel else []
+    if provider_id:
+        provider = DocumentProvider.get_by_id(provider_id)
+        return [provider] if provider else []
     else:
-        return YTChannel.get_all_active()
+        return DocumentProvider.get_all_active_youtube()
 
 
 @task(retries=3, retry_delay_seconds=5)
-def get_db_channel_id(name, channel_id):
-    """Get or create a channel ID in the database using Pydantic models"""
+def get_db_provider_id(name, channel_id):
+    """Get or create a provider ID in the database using Pydantic models"""
     logger = get_run_logger()
-    logger.info(f"Getting/creating database ID for channel: {name}")
+    logger.info(f"Getting/creating database ID for provider: {name}")
     
-    # Check if the channel already exists
-    existing_channel = None
-    channels = YTChannel.get_all_active()
-    for channel in channels:
-        if channel.channel_id == channel_id:
-            existing_channel = channel
+    # Check if the provider already exists
+    existing_provider = None
+    providers = DocumentProvider.get_all_active_youtube()
+    for provider in providers:
+        if provider.yt_channel_id == channel_id:
+            existing_provider = provider
             break
     
-    if existing_channel:
-        logger.info(f"Found existing channel with ID: {existing_channel.id}")
-        return existing_channel.id
+    if existing_provider:
+        logger.info(f"Found existing provider with ID: {existing_provider.id}")
+        return existing_provider.id
     else:
-        # Create new channel
-        new_channel = YTChannel(
+        # Create new provider
+        new_provider = DocumentProvider(
             name=name,
-            channel_id=channel_id,
-            upload_active=True
+            yt_name=name,
+            yt_channel_id=channel_id,
+            yt_upload_active=True
         )
-        new_channel = new_channel.save()
-        logger.info(f"Created new channel with ID: {new_channel.id}")
-        return new_channel.id
+        new_provider = new_provider.save()
+        logger.info(f"Created new provider with ID: {new_provider.id}")
+        return new_provider.id
 
 
 @task(retries=3, retry_delay_seconds=5)
-def insert_unique_urls(db_channel_id, video_entries):
+def insert_unique_urls(db_provider_id, video_entries):
     """Insert or update video entries using Pydantic models"""
     logger = get_run_logger()
-    logger.info(f"Inserting/updating {len(video_entries)} videos for channel ID: {db_channel_id}")
+    logger.info(f"Inserting/updating {len(video_entries)} videos for provider ID: {db_provider_id}")
     
     # Get existing videos to check which ones need updating vs inserting
     existing_videos = {}
-    videos = YTVideo.get_pending_downloads(db_channel_id)
+    videos = YTVideo.get_pending_downloads(db_provider_id)
     for video in videos:
         existing_videos[video.video_id] = video
     
@@ -96,7 +97,7 @@ def insert_unique_urls(db_channel_id, video_entries):
         else:
             # Insert new video
             new_video = YTVideo(
-                yt_channel_id=db_channel_id,
+                document_provider_id=db_provider_id,
                 video_id=url,
                 upload_successful=False,
                 retries_remaining=3,
@@ -113,13 +114,13 @@ def insert_unique_urls(db_channel_id, video_entries):
 
 
 @task(retries=3, retry_delay_seconds=10)
-def load_public_channel_videos(channel_info):
+def load_public_channel_videos(provider_info):
     """Load videos from a public YouTube channel"""
     logger = get_run_logger()
-    channel_name = channel_info.name
-    db_channel_id = channel_info.id
+    provider_name = provider_info.yt_name or provider_info.name
+    db_provider_id = provider_info.id
     
-    logger.info(f"Getting videos for public channel: {channel_name}")
+    logger.info(f"Getting videos for public channel: {provider_name}")
     
     ydl_opts = {
         'quiet': True,
@@ -131,31 +132,31 @@ def load_public_channel_videos(channel_info):
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         # Get channel playlist URL
-        channel_url = f"https://www.youtube.com/{channel_name}/videos"
+        channel_url = f"https://www.youtube.com/{provider_name}/videos"
         result = ydl.extract_info(channel_url, download=False, process=False)
         
         if 'entries' not in result:
-            logger.warning(f"No videos found for channel {channel_name}")
+            logger.warning(f"No videos found for channel {provider_name}")
             return []
         
         # Extract video entries
         video_entries = list(result['entries'])
-        logger.info(f"Found {len(video_entries)} videos in channel {channel_name}")
+        logger.info(f"Found {len(video_entries)} videos in channel {provider_name}")
         
         # Insert videos into database
-        insert_unique_urls(db_channel_id, video_entries)
+        insert_unique_urls(db_provider_id, video_entries)
         
         return video_entries
 
 
 @task(retries=3, retry_delay_seconds=5)
-def get_private_channel_videos(db_channel_id):
-    """Get the list of videos for a private channel from the database"""
+def get_private_channel_videos(db_provider_id):
+    """Get the list of videos for a private provider from the database"""
     logger = get_run_logger()
-    logger.info(f"Getting videos for private channel ID: {db_channel_id}")
+    logger.info(f"Getting videos for private provider ID: {db_provider_id}")
     
-    # Get all private videos for this channel using our model
-    private_videos = YTPrivateChannelVideo.get_by_channel_id(db_channel_id)
+    # Get all private videos for this provider using our model
+    private_videos = YTPrivateChannelVideo.get_by_provider_id(db_provider_id)
     
     videos = [
         {
@@ -165,12 +166,12 @@ def get_private_channel_videos(db_channel_id):
         for video in private_videos
     ]
     
-    logger.info(f"Found {len(videos)} private videos for channel {db_channel_id}")
+    logger.info(f"Found {len(videos)} private videos for provider {db_provider_id}")
     return videos
 
 
 @task(retries=3, retry_delay_seconds=15)
-def extract_video_metadata(video_id, db_channel_id):
+def extract_video_metadata(video_id, db_provider_id):
     """Extract metadata for a specific video"""
     logger = get_run_logger()
     logger.info(f"Extracting metadata for video: {video_id}")
@@ -217,7 +218,7 @@ def extract_video_metadata(video_id, db_channel_id):
 
 
 @task(retries=2, retry_delay_seconds=30)
-def download_video(video_id, db_channel_id, output_dir="videos"):
+def download_video(video_id, db_provider_id, output_dir="videos"):
     """Download a video to disk"""
     logger = get_run_logger()
     logger.info(f"Downloading video {video_id} to disk")
@@ -225,8 +226,14 @@ def download_video(video_id, db_channel_id, output_dir="videos"):
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
+    # Get provider info to get channel ID for directory structure
+    provider = DocumentProvider.get_by_id(db_provider_id)
+    if not provider or not provider.yt_channel_id:
+        logger.error(f"Provider {db_provider_id} not found or has no channel ID")
+        return False
+    
     # Create channel subdirectory
-    channel_dir = os.path.join(output_dir, f"channel_{db_channel_id}")
+    channel_dir = os.path.join(output_dir, provider.yt_channel_id)
     os.makedirs(channel_dir, exist_ok=True)
     
     video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -268,13 +275,13 @@ def download_video(video_id, db_channel_id, output_dir="videos"):
 
 
 @task
-def get_videos_to_download(db_channel_id):
+def get_videos_to_download(db_provider_id):
     """Get videos that need to be downloaded"""
     logger = get_run_logger()
-    logger.info(f"Getting videos to download for channel {db_channel_id}")
+    logger.info(f"Getting videos to download for provider {db_provider_id}")
     
     # Get videos pending download using our model
-    videos = YTVideo.get_pending_downloads(db_channel_id)
+    videos = YTVideo.get_pending_downloads(db_provider_id)
     
     simplified_videos = [
         {
@@ -284,58 +291,58 @@ def get_videos_to_download(db_channel_id):
         for video in videos
     ]
     
-    logger.info(f"Found {len(simplified_videos)} videos to download for channel {db_channel_id}")
+    logger.info(f"Found {len(simplified_videos)} videos to download for provider {db_provider_id}")
     return simplified_videos
 
 
 @flow(name="Process YouTube Channel", description="Process videos from a YouTube channel")
-def process_channel(channel_id=None):
-    """Process a single YouTube channel or all active channels"""
+def process_channel(provider_id=None):
+    """Process a single YouTube provider or all active providers"""
     logger = get_run_logger()
     
-    # Get channel info
-    channels = get_db_channel_info(channel_id)
-    logger.info(f"Processing {len(channels)} channels")
+    # Get provider info
+    providers = get_db_provider_info(provider_id)
+    logger.info(f"Processing {len(providers)} providers")
     
-    for channel in channels:
-        db_channel_id = channel.id
-        is_private = channel.private_channel
+    for provider in providers:
+        db_provider_id = provider.id
+        is_private = provider.yt_private_channel
         
-        # Get videos based on channel type
+        # Get videos based on provider type
         logger.info(f'is private: {is_private}')
         if is_private:
-            logger.info(f"Processing private channel: {channel.name}")
-            videos = get_private_channel_videos(db_channel_id)
+            logger.info(f"Processing private provider: {provider.name}")
+            videos = get_private_channel_videos(db_provider_id)
             
             # For private channels, we need to extract metadata for each video
             for video in videos:
                 video_id = video["id"]
-                metadata = extract_video_metadata(video_id, db_channel_id)
+                metadata = extract_video_metadata(video_id, db_provider_id)
                 
                 if metadata:
                     # Insert or update the video metadata
-                    insert_unique_urls(db_channel_id, [metadata])
+                    insert_unique_urls(db_provider_id, [metadata])
         else:
-            logger.info(f"Processing public channel: {channel.name}")
+            logger.info(f"Processing public provider: {provider.name}")
             # For public channels, we get all videos and metadata in one go
-            load_public_channel_videos(channel)
+            load_public_channel_videos(provider)
         
         # # Get videos that need to be downloaded
-        # videos_to_download = get_videos_to_download(db_channel_id)
+        # videos_to_download = get_videos_to_download(db_provider_id)
         
         # # Download videos
         # for video in videos_to_download:
-        #     download_video(video["video_id"], db_channel_id)
+        #     download_video(video["video_id"], db_provider_id)
 
 
 @flow(name="YouTube Data Pipeline", description="Main flow for YouTube data pipeline")
-def youtube_pipeline(channel_id=None):
+def youtube_pipeline(provider_id=None):
     """Main flow for YouTube data pipeline"""
     logger = get_run_logger()
     logger.info("Starting YouTube data pipeline")
     
-    # Process channels
-    process_channel(channel_id)
+    # Process providers
+    process_channel(provider_id)
     
     logger.info("YouTube data pipeline completed")
 
@@ -344,9 +351,9 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Run YouTube Metadata Scraper Pipeline')
-    parser.add_argument('--channel-id', type=int, help='Channel ID to process (default: process all active channels)')
+    parser.add_argument('--provider-id', type=int, help='Provider ID to process (default: process all active providers)')
     
     args = parser.parse_args()
     
-    # Run the flow with the specified channel ID or for all active channels
-    youtube_pipeline(args.channel_id)
+    # Run the flow with the specified provider ID or for all active providers
+    youtube_pipeline(args.provider_id)
