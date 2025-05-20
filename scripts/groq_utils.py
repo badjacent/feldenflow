@@ -488,6 +488,8 @@ def retrieve_groq_job_status(job_id: int) -> Dict:
     # Determine if job is completed or failed
     is_complete = batch_status in ["completed", "failed"]
     completed_at = datetime.now(timezone.utc) if is_complete and batch_status != job.status else None
+    if not (is_complete):
+        batch_status = "submitted"
     
     # Update job status
     update_job_status(

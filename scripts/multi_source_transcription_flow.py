@@ -188,11 +188,11 @@ async def check_groq_job_status(job_id: int) -> Dict:
                 }
                 
             else:
-                # Job is still processing
+                # Job is still in submitted state
                 return {
                     "id": job_id,
                     "job_id": groq_job.job_id,
-                    "status": "processing",
+                    "status": "submitted",
                     "groq_status": job_status
                 }
     
@@ -206,7 +206,7 @@ async def batch_flow(
     source_type: Optional[SourceType] = None,
     source_id: Optional[int] = None,
     process_all: bool = False,
-    max_sources_per_batch: int = 3
+    max_sources_per_batch: int = 20
 ) -> Optional[Dict]:
     """
     Flow to create and compile a batch of audio chunks for Groq processing.
@@ -217,7 +217,7 @@ async def batch_flow(
         source_type: Optional specific source type to process
         source_id: Optional specific source ID to process
         process_all: Process all available sources
-        max_sources_per_batch: Maximum number of sources to process in a single batch (default: 3)
+        max_sources_per_batch: Maximum number of sources to process in a single batch (default: 20)
         
     Returns:
         Groq job dictionary or None if no chunks available
@@ -364,167 +364,261 @@ async def batch_flow(
     return result_batch
 
 @flow(name="Submit Groq Batch", description="Submit a batch of audio chunks to Groq")
-async def submit_groq_batch_flow(batch_id: Optional[int] = None) -> Dict:
+async def submit_groq_batch_flow(batch_id: Optional[int] = None, process_all: bool = False) -> Dict:
     """
     Flow to submit a batch of audio chunks to Groq
     
     Args:
         batch_id: Optional ID of an existing batch to submit
+        process_all: Process all pending batches if True, otherwise just one batch
         
     Returns:
         Job status dictionary
     """
     logger = get_run_logger()
     
-    # Find the batch or use specified batch ID
-    if batch_id:
-        # Use the specified batch ID
-        logger.info(f"Using specified batch ID: {batch_id}")
-        groq_job = GroqJob.get_by_id(batch_id)
-        if not groq_job:
-            logger.error(f"Batch with ID {batch_id} not found")
-            return {"error": f"Batch with ID {batch_id} not found"}
+    results = []
+    condition = True
+    
+    while condition:
+        # Find the batch or use specified batch ID
+        if batch_id:
+            # Use the specified batch ID
+            logger.info(f"Using specified batch ID: {batch_id}")
+            groq_job = GroqJob.get_by_id(batch_id)
+            if not groq_job:
+                logger.error(f"Batch with ID {batch_id} not found")
+                return {"error": f"Batch with ID {batch_id} not found"}
+            # Turn off process_all when a specific batch is provided
+            process_all = False
+        else:
+            # Find the earliest pending batch
+            groq_job = GroqJob.get_earliest_by_status("pending")
+            if not groq_job:
+                logger.info("No pending batches found to submit")
+                if results:
+                    return {"status": "completed", "results": results, "processed_count": len(results)}
+                else:
+                    return {"status": "no_pending_batches"}
+            batch_id = groq_job.id
+            logger.info(f"Found earliest pending batch with ID: {batch_id}")
+        
+        # Check if batch is already submitted
+        if groq_job.status != "pending":
+            logger.warning(f"Batch {batch_id} has status '{groq_job.status}', not 'pending'")
+            if process_all:
+                # Reset batch_id and continue to the next batch
+                batch_id = None
+                continue
+            else:
+                return {"error": f"Batch {batch_id} has status '{groq_job.status}', not 'pending'"}
+        
+        # Get chunks for this batch
+        chunks = GroqJobChunk.get_by_job_id(batch_id)
+        if not chunks:
+            logger.warning(f"No chunks found for batch {batch_id}")
+            if process_all:
+                # Reset batch_id and continue to the next batch
+                batch_id = None
+                continue
+            else:
+                return {"error": f"No chunks found for batch {batch_id}"}
+        
+        logger.info(f"Found {len(chunks)} chunks for batch {batch_id}")
+        
+        # Transform chunks to the format expected by submit_groq_job
+        batch_info = {
+            "id": groq_job.id,
+            "job_id": groq_job.job_id,
+            "status": groq_job.status,
+            "chunks": [
+                {
+                    "id": chunk.id,
+                    "source_type": chunk.source_type,
+                    "source_id": chunk.source_id,
+                    "chunk_index": chunk.chunk_index,
+                    "start_time": chunk.start_time,
+                    "end_time": chunk.end_time,
+                    "s3_uri": chunk.s3_uri,
+                    "name": chunk.name
+                }
+                for chunk in chunks
+            ],
+            "num_chunks": len(chunks)
+        }
+        
+        # Submit the batch to Groq
+        result = await submit_groq_job(batch_info)
+        results.append(result)
+        
+        # If process_all is False or no result was returned, break the loop
+        if not process_all or not result:
+            condition = False
+        else:
+            # Reset batch_id to get the next pending batch
+            batch_id = None
+    
+    # Return the last result if not processing all, otherwise return all results
+    if not process_all or len(results) == 1:
+        return results[0] if results else {"status": "no_results"}
     else:
-        # Find the earliest pending batch
-        groq_job = GroqJob.get_earliest_by_status("pending")
-        if not groq_job:
-            logger.info("No pending batches found to submit")
-            return {"status": "no_pending_batches"}
-        batch_id = groq_job.id
-        logger.info(f"Found earliest pending batch with ID: {batch_id}")
-    
-    # Check if batch is already submitted
-    if groq_job.status != "pending":
-        logger.warning(f"Batch {batch_id} has status '{groq_job.status}', not 'pending'")
-        return {"error": f"Batch {batch_id} has status '{groq_job.status}', not 'pending'"}
-    
-    # Get chunks for this batch
-    chunks = GroqJobChunk.get_by_job_id(batch_id)
-    if not chunks:
-        logger.warning(f"No chunks found for batch {batch_id}")
-        return {"error": f"No chunks found for batch {batch_id}"}
-    
-    logger.info(f"Found {len(chunks)} chunks for batch {batch_id}")
-    
-    # Transform chunks to the format expected by submit_groq_job
-    batch_info = {
-        "id": groq_job.id,
-        "job_id": groq_job.job_id,
-        "status": groq_job.status,
-        "chunks": [
-            {
-                "id": chunk.id,
-                "source_type": chunk.source_type,
-                "source_id": chunk.source_id,
-                "chunk_index": chunk.chunk_index,
-                "start_time": chunk.start_time,
-                "end_time": chunk.end_time,
-                "s3_uri": chunk.s3_uri,
-                "name": chunk.name
-            }
-            for chunk in chunks
-        ],
-        "num_chunks": len(chunks)
-    }
-    
-    # Submit the batch to Groq
-    result = await submit_groq_job(batch_info)
-    
-    return result
+        return {"status": "completed", "results": results, "processed_count": len(results)}
 
 
 @flow(name="Retrieve Groq Batch", description="Retrieve a batch of audio chunks to Groq")
-async def retrieve_groq_job_status_flow(batch_id: Optional[int] = None) -> Dict:
+async def retrieve_groq_job_status_flow(batch_id: Optional[int] = None, process_all: bool = False) -> Dict:
     """
     Flow to retrieve and update the status of a Groq batch
     
     Args:
         batch_id: Optional ID of an existing batch to check
+        process_all: Process all submitted batches if True, otherwise just one batch
         
     Returns:
         Job status dictionary
     """
     logger = get_run_logger()
     
-    # If no batch_id is provided, find the earliest submitted batch
-    if not batch_id:
-        groq_job = GroqJob.get_earliest_by_status("submitted")
-        if groq_job:
-            batch_id = groq_job.id
-            logger.info(f"Found earliest submitted batch with ID: {batch_id}")
+    results = []
+    condition = True
+    
+    while condition:
+        current_batch_id = batch_id
+        
+        # If no batch_id is provided, find the earliest submitted batch
+        if not current_batch_id:
+            groq_job = GroqJob.get_earliest_by_status("submitted")
+            if groq_job:
+                current_batch_id = groq_job.id
+                logger.info(f"Found earliest submitted batch with ID: {current_batch_id}")
+            else:
+                logger.info("No submitted batches found to retrieve")
+                if results:
+                    return {"status": "completed", "results": results, "processed_count": len(results)}
+                else:
+                    return {"status": "no_submitted_batches"}
         else:
-            logger.info("No submitted batches found to retrieve")
-            return {"status": "no_submitted_batches"}
+            # If a specific batch ID is provided, turn off process_all
+            process_all = False
+        
+        # Retrieve the batch status
+        status = retrieve_groq_job_status(current_batch_id)
+        
+        # Update chunks if needed
+        update_groq_job_chunks(current_batch_id)
+        
+        # Add to results
+        results.append(status)
+        
+        # If process_all is False or no result was returned, break the loop
+        if not process_all or not status:
+            condition = False
+        else:
+            # Reset batch_id to get the next submitted batch
+            batch_id = None
     
-    # Retrieve the batch status
-    status = retrieve_groq_job_status(batch_id)
-    
-    # Update chunks if needed
-    update_groq_job_chunks(batch_id)
-    
-    return status
+    # Return the last result if not processing all, otherwise return all results
+    if not process_all or len(results) == 1:
+        return results[0] if results else {"status": "no_results"}
+    else:
+        return {"status": "completed", "results": results, "processed_count": len(results)}
 
 @flow(name="Combine Groq Batch", description="Create a batch of audio chunks for Groq processing")
 async def combine_groq_chunks_via_anthropic(
     source_type: Optional[SourceType] = None, 
-    source_id: Optional[int] = None
+    source_id: Optional[int] = None,
+    process_all: bool = False
 ) -> Optional[Dict]:
     logger = get_run_logger()
     
-    # If source_type and source_id are provided, use them directly
-    if source_type and source_id:
-        logger.info(f"Processing specified entity: {source_type} with ID {source_id}")
+    results = []
+    condition = True
+    
+    while condition:
+        current_source_type = source_type
+        current_source_id = source_id
         
-        # Verify that the entity exists and has completed transcriptions
-        chunks = GroqJobChunk.get_by_source(source_type, source_id)
+        # If source_type and source_id are provided, use them directly
+        if current_source_type and current_source_id:
+            logger.info(f"Processing specified entity: {current_source_type} with ID {current_source_id}")
+            
+            # Verify that the entity exists and has completed transcriptions
+            chunks = GroqJobChunk.get_by_source(current_source_type, current_source_id)
+            
+            if not chunks:
+                logger.error(f"No chunks found for {current_source_type} with ID {current_source_id}")
+                if results:
+                    return {"status": "completed", "results": results, "processed_count": len(results)}
+                else:
+                    return {"error": f"No chunks found for {current_source_type} with ID {current_source_id}"}
+            
+            incomplete_chunks = [chunk for chunk in chunks if not chunk.transcription]
+            if incomplete_chunks:
+                logger.error(f"Transcription incomplete for {current_source_type} with ID {current_source_id}. {len(incomplete_chunks)} chunks not transcribed.")
+                if results:
+                    return {"status": "completed", "results": results, "processed_count": len(results)}
+                else:
+                    return {"error": f"Transcription incomplete for {current_source_type} with ID {current_source_id}"}
+                
+            # Once we've processed a specific source, turn off process_all
+            process_all = False
+        else:
+            # Get the completed sources that don't have a merged transcription yet
+            completed_sources = GroqJobChunk.get_completed_sources_without_transcription()
+            if not completed_sources:
+                logger.info("No transcriptions pending")
+                if results:
+                    return {"status": "completed", "results": results, "processed_count": len(results)}
+                else:
+                    return {"error": "No transcriptions pending"}
+            
+            current_source_type = completed_sources[0]["source_type"]
+            current_source_id = completed_sources[0]["source_id"]
+            logger.info(f"Processing entity: {current_source_type} with ID {current_source_id}")
         
-        if not chunks:
-            logger.error(f"No chunks found for {source_type} with ID {source_id}")
-            return {"error": f"No chunks found for {source_type} with ID {source_id}"}
+        # Get chunks for this source
+        chunks = GroqJobChunk.get_by_source(current_source_type, current_source_id)
+        chunks.sort(key=lambda x: x.chunk_index)
         
-        incomplete_chunks = [chunk for chunk in chunks if not chunk.transcription]
-        if incomplete_chunks:
-            logger.error(f"Transcription incomplete for {source_type} with ID {source_id}. {len(incomplete_chunks)} chunks not transcribed.")
-            return {"error": f"Transcription incomplete for {source_type} with ID {source_id}"}
+        # Extract transcriptions
+        transcriptions = [chunk.transcription for chunk in chunks if chunk.transcription]
+        
+        # Merge transcriptions
+        if len(transcriptions) == 1:
+            transcription_text = transcriptions[0]
+        else:
+            transcription_text = merge_multiple_transcriptions(transcriptions)
+        
+        # Save to database
+        transcription = Transcription(
+            source_type=current_source_type,
+            source_id=current_source_id,
+            transcription=transcription_text
+        )
+        transcription.save()
+        
+        result = {
+            "status": "success",
+            "source_type": current_source_type,
+            "source_id": current_source_id,
+            "transcription_id": transcription.id,
+            "chunks_merged": len(transcriptions)
+        }
+        results.append(result)
+        
+        # If process_all is False or we just processed a specific source, break the loop
+        if not process_all:
+            condition = False
+        else:
+            # Reset source_type and source_id to get the next source
+            source_type = None
+            source_id = None
+    
+    # Return the last result if not processing all, otherwise return all results
+    if len(results) == 1:
+        return results[0]
     else:
-        # Get the first entity with completed transcriptions
-        completed_sources = GroqJobChunk.get_completed_sources_without_transcription()
-        if not completed_sources:
-            logger.error(f"No transcriptions pending")
-            return {"error": f"No transcriptions pending"}
-        
-        source_type = completed_sources[0]["source_type"]
-        source_id = completed_sources[0]["source_id"]
-        logger.info(f"Processing first available entity: {source_type} with ID {source_id}")
-    
-    # Get chunks for this source
-    chunks = GroqJobChunk.get_by_source(source_type, source_id)
-    chunks.sort(key=lambda x: x.chunk_index)
-    
-    # Extract transcriptions
-    transcriptions = [chunk.transcription for chunk in chunks if chunk.transcription]
-    
-    # Merge transcriptions
-    if len(transcriptions) == 1:
-        transcription_text = transcriptions[0]
-    else:
-        transcription_text = merge_multiple_transcriptions(transcriptions)
-    
-    # Save to database
-    transcription = Transcription(
-        source_type=source_type,
-        source_id=source_id,
-        transcription=transcription_text
-    )
-    transcription.save()
-    
-    return {
-        "status": "success",
-        "source_type": source_type,
-        "source_id": source_id,
-        "transcription_id": transcription.id,
-        "chunks_merged": len(transcriptions)
-    }
+        return {"status": "completed", "results": results, "processed_count": len(results)}
 
 
 @flow(name="Multi-Source Transcription Pipeline", description="Main flow for multi-source transcription pipeline")
@@ -549,8 +643,8 @@ if __name__ == "__main__":
     parser.add_argument('--source-id', type=int, help='Source ID for process or transcription flows')
     parser.add_argument('--batch-id', type=int, help='Batch ID for submit or retrieve flow')
     parser.add_argument('--process-all', type=bool, default=False, help='If true then process all')
-    parser.add_argument('--max-sources', type=int, default=3, 
-                        help='Maximum number of sources to process in a single batch (default: 3)')
+    parser.add_argument('--max-sources', type=int, default=20, 
+                        help='Maximum number of sources to process in a single batch (default: 20)')
 
     
     args = parser.parse_args()
@@ -560,9 +654,9 @@ if __name__ == "__main__":
         asyncio.run(batch_flow(args.source_type, args.source_id, process_all, args.max_sources))
 
     elif args.flow == 'submit':
-        asyncio.run(submit_groq_batch_flow(args.batch_id))
+        asyncio.run(submit_groq_batch_flow(args.batch_id, process_all))
     elif args.flow == 'retrieve':
-        asyncio.run(retrieve_groq_job_status_flow(args.batch_id))
+        asyncio.run(retrieve_groq_job_status_flow(args.batch_id, process_all))
     elif args.flow == 'combine':
-        # Pass the source_type and source_id to the combine flow
-        asyncio.run(combine_groq_chunks_via_anthropic(args.source_type, args.source_id))        
+        # Pass the source_type, source_id, and process_all to the combine flow
+        asyncio.run(combine_groq_chunks_via_anthropic(args.source_type, args.source_id, process_all))        

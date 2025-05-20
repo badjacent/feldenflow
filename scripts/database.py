@@ -506,7 +506,7 @@ class Transcription(DBModel):
 # Groq job models
 
 # Define GroqJobStatus as a type alias
-GroqJobStatus = Literal["pending", "submitted", "processing", "completed", "failed", "error"]
+GroqJobStatus = Literal["pending", "submitted", "completed", "failed", "error"]
 
 
 class GroqJobChunk(DBModel):
