@@ -360,7 +360,7 @@ def insert_video_metadata(video_info: Dict, provider_id: int) -> Dict:
         conn.close()
 
 @flow(name="Download Videos", description="Download videos from YouTube")
-async def download_videos_flow(videos_to_process: List[Dict] = None, limit: int = 20) -> List[Dict]:
+async def download_videos_flow(videos_to_process: List[Dict] = None, limit: int = 40) -> List[Dict]:
     """
     Flow to download multiple videos concurrently
     

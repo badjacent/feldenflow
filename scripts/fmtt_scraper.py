@@ -3,6 +3,7 @@ import time
 import json
 import re
 import logging
+import traceback
 from typing import List, Dict, Optional
 
 from prefect import flow, task
@@ -226,6 +227,7 @@ def save_videos_to_database(videos: List[Dict[str, str]], provider_id: int) -> i
     
     except Exception as e:
         logger.error(f"Database insertion error: {e}")
+        traceback.print_exc()
         return 0
 
 @flow(log_prints=True, persist_result=False)

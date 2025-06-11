@@ -100,6 +100,28 @@ class DocumentProvider(DBModel):
                     except Exception as e:
                         print(f"Error creating provider from record {record}: {e}")
                 return providers
+            
+    @classmethod
+    def get_all(cls) -> List['DocumentProvider']:
+        """Get all active YouTube providers."""
+        with cls.get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """SELECT id, name, yt_name, yt_channel_id,
+                       yt_upload_active::int::boolean as yt_upload_active,
+                       yt_upload_from_date,
+                       yt_private_channel::int::boolean as yt_private_channel
+                       FROM document_provider 
+                       """
+                )
+                records = cursor.fetchall()
+                providers = []
+                for record in records:
+                    try:
+                        providers.append(cls(**record))
+                    except Exception as e:
+                        print(f"Error creating provider from record {record}: {e}")
+                return providers            
 
     def save(self) -> 'DocumentProvider':
         """Save provider to database."""
@@ -251,12 +273,18 @@ class YTVideo(DBModel):
                            WHERE id = %s
                            RETURNING id""",
                         (self.document_provider_id, self.video_id,
-                         'B\'1\'' if self.upload_successful else 'B\'0\'',
+                         '1' if self.upload_successful else '0',
                          self.retries_remaining,
                          json.dumps(self.entry.dict()),
                          now, self.id)
                     )
                 else:
+                    s =  (self.document_provider_id, self.video_id,
+                         'B\'1\'' if self.upload_successful else 'B\'0\'',
+                         self.retries_remaining,
+                         json.dumps(self.entry.dict()),
+                         now, now)
+                    print(f'executing {s}')
                     # Insert new video
                     cursor.execute(
                         """INSERT INTO yt_video 
@@ -265,7 +293,7 @@ class YTVideo(DBModel):
                            VALUES (%s, %s, %s, %s, %s, %s, %s) 
                            RETURNING id""",
                         (self.document_provider_id, self.video_id,
-                         'B\'1\'' if self.upload_successful else 'B\'0\'',
+                         '1' if self.upload_successful else '0',
                          self.retries_remaining,
                          json.dumps(self.entry.dict()),
                          now, now)

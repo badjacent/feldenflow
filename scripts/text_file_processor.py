@@ -1,7 +1,7 @@
 """
 Text file processor for Feldenflow.
 
-This script monitors a drop directory for text files, processes them,
+This script monitors a drop directory for text files and PDFs, processes them,
 and adds them to the database.
 """
 
@@ -11,9 +11,11 @@ import shutil
 import glob
 from datetime import datetime, timezone
 import asyncio
+import io
 
 from prefect import flow, task, get_run_logger
 from dotenv import load_dotenv
+import PyPDF2  # For PDF text extraction
 
 load_dotenv()
 
@@ -40,7 +42,7 @@ def scan_provider_drop_directories() -> List[Tuple[str, DocumentProvider]]:
         return []
     
     # Get all providers from database
-    providers = DocumentProvider.get_all_active_youtube()  # We can use this as it gets all providers
+    providers = DocumentProvider.get_all()  # We can use this as it gets all providers
     
     # Create drop directory if it doesn't exist
     drop_base_dir = os.path.join(storage_path, "drop")
@@ -61,9 +63,10 @@ def scan_provider_drop_directories() -> List[Tuple[str, DocumentProvider]]:
         if not os.path.exists(provider_dir):
             continue
         
-        # Find all text files (txt, md, etc.)
+        # Find all text files (txt, md, pdf, etc.)
         text_files = glob.glob(os.path.join(provider_dir, "*.txt"))
         text_files.extend(glob.glob(os.path.join(provider_dir, "*.md")))
+        text_files.extend(glob.glob(os.path.join(provider_dir, "*.pdf")))
         
         # Add files to the list
         for file_path in text_files:
@@ -136,7 +139,7 @@ def process_text_file(file_path: str, provider: DocumentProvider) -> Optional[Te
 @task
 def create_transcription(text_file: TextField) -> Optional[Transcription]:
     """
-    Create a transcription entry for a text file.
+    Create a transcription entry for a text file or PDF.
     
     Args:
         text_file: TextField instance
@@ -147,9 +150,17 @@ def create_transcription(text_file: TextField) -> Optional[Transcription]:
     logger = get_run_logger()
     
     try:
-        # Read file content
-        with open(text_file.file_path, 'r', encoding='utf-8') as f:
-            file_content = f.read()
+        file_path = text_file.file_path
+        file_extension = os.path.splitext(file_path)[1].lower()
+        
+        # Extract text based on file type
+        if file_extension == '.pdf':
+            # Extract text from PDF
+            file_content = extract_text_from_pdf(file_path)
+        else:
+            # Regular text file
+            with open(file_path, 'r', encoding='utf-8') as f:
+                file_content = f.read()
         
         # Create transcription
         transcription = Transcription(
@@ -165,6 +176,37 @@ def create_transcription(text_file: TextField) -> Optional[Transcription]:
     except Exception as e:
         logger.error(f"Error creating transcription for text file {text_file.id}: {e}")
         return None
+
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """
+    Extract text from a PDF file.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        
+    Returns:
+        Extracted text content as string
+    """
+    logger = get_run_logger()
+    
+    try:
+        text = ""
+        with open(pdf_path, 'rb') as pdf_file:
+            # Create PDF reader object
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            # Extract text from each page
+            for page_num in range(len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                text += page.extract_text() + "\n\n"
+        
+        logger.info(f"Successfully extracted text from PDF: {pdf_path}")
+        return text
+    
+    except Exception as e:
+        logger.error(f"Error extracting text from PDF {pdf_path}: {e}")
+        # Return empty string on error to avoid breaking the flow
+        return f"[Error extracting text from PDF: {str(e)}]"
 
 @flow(name="Text File Processing Flow", description="Process text files from drop directories")
 async def text_file_processing_flow():

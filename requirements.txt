@@ -12,6 +12,7 @@ python-dotenv
 # Utilities
 requests
 typing-extensions
+PyPDF2  # PDF text extraction
 
 # Optional: Web automation
 webdriver-manager
